@@ -1,1 +1,388 @@
+import React, { useState, useEffect, useRef } from 'react';
 
+// === 核心配置与数据 ===
+const ENEMY_TYPES = [
+  { name: '史莱姆 💧', baseHp: 30, baseAtk: 5, baseDef: 2 },
+  { name: '哥布林 👺', baseHp: 50, baseAtk: 8, baseDef: 3 },
+  { name: '恶狼 🐺', baseHp: 40, baseAtk: 12, baseDef: 1 },
+  { name: '骷髅兵 💀', baseHp: 60, baseAtk: 10, baseDef: 5 },
+];
+
+// 精英怪配置 (原 BOSS 数值)
+const ELITE_TYPES = [
+  { name: '幽灵骑士 👻', hpMod: 2.2, atkMod: 1.6, defMod: 1.4 },
+  { name: '狂暴巨魔 👹', hpMod: 2.5, atkMod: 1.8, defMod: 1.2 },
+  { name: '剧毒蜘蛛 🕷️', hpMod: 2.0, atkMod: 2.0, defMod: 1.0 },
+];
+
+// 大 BOSS 配置 (更强悍的属性与专属掉落)
+const MEGA_BOSS_TYPES = [
+  { name: '毁灭者·亚巴顿 ☄️', hpMod: 6.5, atkMod: 3.2, defMod: 2.5, skill: '末日审判' },
+  { name: '深渊主宰·克苏鲁 🦑', hpMod: 8.0, atkMod: 2.8, defMod: 3.0, skill: '疯狂低语' },
+  { name: '不朽之王·李奥瑞克 👑', hpMod: 5.5, atkMod: 3.8, defMod: 2.2, skill: '亡灵大军' },
+];
+
+const SET_CONFIGS = [
+  { id: 'brave', name: '无畏', bonus2: { atk: 15, dmgPct: 10 }, bonus3: { atk: 45, dmgPct: 30 } },
+  { id: 'guardian', name: '守护', bonus2: { def: 10, hpPct: 20 }, bonus3: { def: 35, hpPct: 60 } },
+  { id: 'lucky', name: '幸运', bonus2: { gold: 2.0, dr: 5 }, bonus3: { gold: 4.5, dr: 15 } },
+];
+
+const ITEM_ADJECTIVES = ['破旧的', '普通的', '精良的', '史诗的', '传说的'];
+const WEAPON_NAMES = ['铁剑 🗡️', '木棍 🏏', '匕首 🗡️', '战斧 🪓'];
+const ARMOR_NAMES = ['布衣 👕', '皮甲 🦺', '锁子甲 🛡️', '板甲 🛡️'];
+const ACCESSORY_NAMES = ['指环 💍', '项链 📿', '护身符 🧿'];
+
+export default function App() {
+  const [player, setPlayer] = useState({
+    level: 1, exp: 0, maxExp: 100, hp: 100, maxHp: 100,
+    baseAtk: 12, baseDef: 6, gold: 500,
+    equipment: { weapon: null, armor: null, accessory: null },
+    bossProgress: 0, // 距离精英怪的进度
+    eliteDefeatedCount: 0, // 已击败精英怪数量
+    nextEliteTarget: 5,
+    megaBossTarget: 3, // 每3个精英怪出一个大BOSS
+    statUpgrades: { atk: 0, def: 0, hp: 0 },
+    bossFailCount: 0,
+    turnCount: 0
+  });
+
+  const [inventory, setInventory] = useState([]);
+  const [shopItems, setShopItems] = useState([]);
+  const [enemy, setEnemy] = useState(null);
+  const [logs, setLogs] = useState(["[系统] 精英与大领主系统已就绪。"]);
+  const logEndRef = useRef(null);
+
+  // === 属性计算逻辑 ===
+  const getActiveSets = () => {
+    const counts = {};
+    Object.values(player.equipment).forEach(item => { if (item?.setName) counts[item.setName] = (counts[item.setName] || 0) + 1; });
+    let bonuses = { atk: 0, def: 0, goldMult: 1, hpPct: 0, dmgPct: 0, dr: 0 };
+    const activeBonuses = [];
+    Object.keys(counts).forEach(setName => {
+      const config = SET_CONFIGS.find(s => s.name === setName);
+      if (config && counts[setName] >= 2) {
+        const bonus = counts[setName] === 3 ? config.bonus3 : config.bonus2;
+        Object.keys(bonus).forEach(key => { if(key === 'gold') bonuses.goldMult *= bonus[key]; else bonuses[key] += bonus[key]; });
+        activeBonuses.push({ name: setName, count: counts[setName], details: bonus });
+      }
+    });
+    return { bonuses, activeBonuses };
+  };
+
+  const { bonuses: setBonus, activeBonuses } = getActiveSets();
+  const upgradeAtk = player.statUpgrades.atk * 5;
+  const upgradeDef = player.statUpgrades.def * 3;
+  const upgradeHp = player.statUpgrades.hp * 25;
+  const finalMaxHp = (player.maxHp + upgradeHp) * (1 + setBonus.hpPct / 100);
+  const totalAtk = Math.floor((player.baseAtk + upgradeAtk + (player.equipment.weapon?.value || 0) + (player.equipment.accessory?.value || 0) + setBonus.atk) * (1 + setBonus.dmgPct / 100));
+  const totalDef = player.baseDef + upgradeDef + (player.equipment.armor?.value || 0) + setBonus.def;
+
+  useEffect(() => { if (player.hp > finalMaxHp) setPlayer(p => ({ ...p, hp: finalMaxHp })); }, [finalMaxHp]);
+  useEffect(() => { if (shopItems.length === 0) refreshShop(); }, [player.level]);
+  useEffect(() => { if (player.turnCount > 0 && player.turnCount % 3 === 0) refreshShop(); }, [player.turnCount]);
+  useEffect(() => { logEndRef.current?.scrollIntoView({ behavior: 'smooth' }); }, [logs]);
+
+  const addLog = (msg) => setLogs(prev => [...prev, msg].slice(-40));
+
+  const generateItem = (lvl, forceRarity = -1) => {
+    const types = ['weapon', 'armor', 'accessory'];
+    const type = types[Math.floor(Math.random() * types.length)];
+    let rarity = forceRarity !== -1 ? forceRarity : (Math.random() > 0.95 ? 4 : Math.random() > 0.8 ? 3 : Math.random() > 0.5 ? 2 : 0);
+    const setName = Math.random() > 0.4 ? SET_CONFIGS[Math.floor(Math.random() * SET_CONFIGS.length)].name : '';
+    let baseName = type === 'weapon' ? WEAPON_NAMES[Math.floor(Math.random()*WEAPON_NAMES.length)] : type === 'armor' ? ARMOR_NAMES[Math.floor(Math.random()*ARMOR_NAMES.length)] : ACCESSORY_NAMES[Math.floor(Math.random()*ACCESSORY_NAMES.length)];
+    return { id: Math.random().toString(36).substr(2, 9), name: (setName ? `[${setName}]` : '') + ITEM_ADJECTIVES[rarity] + baseName, type, value: Math.floor((rarity + 1) * 5 + lvl * 2), rarity, setName, price: (rarity + 1) * 50 + lvl * 15 };
+  };
+
+  const refreshShop = () => setShopItems([generateItem(player.level, 3), generateItem(player.level), generateItem(player.level), generateItem(player.level)]);
+
+  const handleAutoEquip = (newItem) => {
+    const current = player.equipment[newItem.type];
+    if (!current || newItem.value > current.value) {
+      setPlayer(p => ({ ...p, equipment: { ...p.equipment, [newItem.type]: newItem } }));
+      if (current) setInventory(inv => [...inv, current]);
+      addLog(`⬆️ 自动装备: ${newItem.name}`);
+      return true;
+    }
+    return false;
+  };
+
+  const spawnEnemy = () => {
+    const isMegaBoss = player.eliteDefeatedCount >= player.megaBossTarget;
+    const isElite = !isMegaBoss && player.bossProgress >= player.nextEliteTarget;
+    
+    const mult = 1 + (player.level - 1) * 0.25;
+    const nerf = Math.pow(0.85, player.bossFailCount);
+
+    if (isMegaBoss) {
+      const base = MEGA_BOSS_TYPES[Math.floor(Math.random() * MEGA_BOSS_TYPES.length)];
+      setEnemy({
+        name: `👑 ${base.name}`,
+        hp: Math.floor(150 * base.hpMod * mult * nerf),
+        maxHp: Math.floor(150 * base.hpMod * mult * nerf),
+        atk: Math.floor(18 * base.atkMod * mult * nerf),
+        def: Math.floor(10 * base.defMod * mult * nerf),
+        isBoss: true, isMega: true, skill: base.skill
+      });
+      addLog(`🚨 终极警告：${base.name} 降临了！`);
+    } else if (isElite) {
+      const base = ELITE_TYPES[Math.floor(Math.random() * ELITE_TYPES.length)];
+      setEnemy({
+        name: `🔶 ${base.name}`,
+        hp: Math.floor(100 * base.hpMod * mult * nerf),
+        maxHp: Math.floor(100 * base.hpMod * mult * nerf),
+        atk: Math.floor(14 * base.atkMod * mult * nerf),
+        def: Math.floor(7 * base.defMod * mult * nerf),
+        isBoss: true, isMega: false
+      });
+      addLog(`🔸 遭遇精英敌方：${base.name}`);
+    } else {
+      const base = ENEMY_TYPES[Math.floor(Math.random() * ENEMY_TYPES.length)];
+      setEnemy({
+        name: base.name,
+        hp: Math.floor(base.baseHp * mult),
+        maxHp: Math.floor(base.baseHp * mult),
+        atk: Math.floor(base.baseAtk * mult),
+        def: Math.floor(base.baseDef * mult),
+        isBoss: false
+      });
+    }
+  };
+
+  const attack = () => {
+    if (!enemy) return;
+    const pDmg = Math.max(1, totalAtk - enemy.def);
+    const eHp = enemy.hp - pDmg;
+
+    if (eHp <= 0) {
+      const gold = Math.floor((enemy.isMega ? 1500 : enemy.isBoss ? 400 : 50) * setBonus.goldMult);
+      const exp = enemy.isMega ? 1000 : enemy.isBoss ? 300 : 60;
+      
+      // 更新玩家状态
+      setPlayer(p => {
+        let nExp = p.exp + exp;
+        let nLvl = p.level;
+        let nMaxExp = p.maxExp;
+        if (nExp >= nMaxExp) { nLvl++; nExp -= nMaxExp; nMaxExp += 70; }
+        
+        return {
+          ...p, level: nLvl, exp: nExp, maxExp: nMaxExp, gold: p.gold + gold, hp: Math.min(finalMaxHp, p.hp + (enemy.isMega ? 100 : 40)),
+          bossProgress: enemy.isBoss ? 0 : p.bossProgress + 1,
+          eliteDefeatedCount: enemy.isMega ? 0 : (enemy.isBoss ? p.eliteDefeatedCount + 1 : p.eliteDefeatedCount),
+          bossFailCount: 0,
+          turnCount: p.turnCount + 1
+        };
+      });
+
+      // 掉落逻辑
+      if (enemy.isMega) {
+        const item = generateItem(player.level, 4); // 大BOSS必掉传说
+        addLog(`🌟 史诗捷报！获得了传说装备：${item.name}`);
+        if (!handleAutoEquip(item)) setInventory(inv => [...inv, item]);
+      } else if (enemy.isBoss || Math.random() < 0.3) {
+        const item = generateItem(player.level, enemy.isBoss ? 3 : -1);
+        if (!handleAutoEquip(item)) setInventory(inv => [...inv, item]);
+      }
+
+      setEnemy(null);
+      addLog(`🏆 胜利！获得 ${gold}G 金币。`);
+    } else {
+      const eDmg = Math.max(1, Math.max(1, enemy.atk - totalDef) - setBonus.dr);
+      const pHp = player.hp - eDmg;
+      setPlayer(p => ({ ...p, hp: Math.max(0, pHp) }));
+      setEnemy({ ...enemy, hp: eHp });
+
+      if (pHp <= 0) {
+        addLog("💀 战败！失去了部分金币，进度重置。");
+        setPlayer(p => ({ ...p, hp: finalMaxHp, gold: Math.floor(p.gold * 0.8), bossProgress: 0, bossFailCount: enemy.isBoss ? p.bossFailCount + 1 : p.bossFailCount, turnCount: p.turnCount + 1 }));
+        setEnemy(null);
+      }
+    }
+  };
+
+  const getRarityColor = (r) => ['text-slate-400', 'text-green-500', 'text-blue-500', 'text-purple-500', 'text-orange-500'][r];
+
+  return (
+    <div className="min-h-screen bg-[#0a0a0c] text-slate-300 p-4 font-mono select-none flex flex-col items-center">
+      <div className="max-w-7xl w-full grid grid-cols-1 lg:grid-cols-12 gap-6">
+        
+        {/* 状态栏 */}
+        <div className="lg:col-span-3 space-y-4">
+          <div className="bg-white/5 border border-white/10 rounded-2xl p-5">
+            <h2 className="text-white font-black flex justify-between border-b border-white/5 pb-2 mb-4">
+              <span>Lv.{player.level} 英雄</span>
+              <span className="text-yellow-500">{player.gold} G</span>
+            </h2>
+            <div className="space-y-3">
+              <div>
+                <div className="flex justify-between text-[10px] mb-1">
+                  <span className="text-red-500 font-black italic">HP</span>
+                  <span>{Math.floor(player.hp)} / {Math.floor(finalMaxHp)}</span>
+                </div>
+                <div className="h-2 bg-black rounded-full overflow-hidden border border-white/5">
+                  <div className="h-full bg-red-600 transition-all" style={{ width: `${(player.hp/finalMaxHp)*100}%` }}></div>
+                </div>
+              </div>
+              <div className="grid grid-cols-2 gap-2 text-center">
+                <div className="bg-white/5 p-2 rounded border border-white/5">
+                  <p className="text-[9px] text-slate-500 font-black uppercase">攻击</p>
+                  <p className="text-xl font-black text-orange-500">{totalAtk}</p>
+                </div>
+                <div className="bg-white/5 p-2 rounded border border-white/5">
+                  <p className="text-[9px] text-slate-500 font-black uppercase">防御</p>
+                  <p className="text-xl font-black text-blue-500">{totalDef}</p>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <div className="bg-white/5 border border-white/10 rounded-2xl p-4">
+            <h3 className="text-[10px] font-black text-slate-500 mb-3 uppercase italic">已装备</h3>
+            <div className="space-y-2">
+              {['weapon', 'armor', 'accessory'].map(t => {
+                const item = player.equipment[t];
+                return (
+                  <div key={t} className="bg-black/40 border border-white/5 p-2 rounded flex justify-between items-center">
+                    <div>
+                      <div className={`text-[10px] font-bold ${item ? getRarityColor(item.rarity) : 'text-slate-800'}`}>
+                        {item ? item.name : '空'}
+                      </div>
+                      {item && <span className="text-[9px] text-slate-500">+{item.value}</span>}
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+        </div>
+
+        {/* 战场 */}
+        <div className="lg:col-span-6 space-y-6">
+          <div className={`flex-1 bg-white/5 border border-white/10 rounded-[3rem] p-8 min-h-[420px] flex flex-col items-center justify-center relative shadow-inner overflow-hidden ${enemy?.isMega ? 'ring-2 ring-red-900/50' : ''}`}>
+            {enemy ? (
+              <div className={`w-full text-center z-10 ${enemy.isMega ? 'animate-shake' : ''}`}>
+                <div className="mb-6">
+                  <div className={`text-7xl mb-4 drop-shadow-lg ${enemy.isMega ? 'animate-pulse scale-110' : ''}`}>
+                    {enemy.name.split(' ').pop()}
+                  </div>
+                  <h2 className={`text-4xl font-black ${enemy.isMega ? 'text-red-500 uppercase italic tracking-tighter' : enemy.isBoss ? 'text-orange-500' : 'text-white'}`}>
+                    {enemy.name}
+                  </h2>
+                </div>
+
+                <div className="flex justify-center gap-4 mb-8 text-xs font-black">
+                  <span className="px-3 py-1 bg-white/5 rounded-full">⚔️ {enemy.atk}</span>
+                  <span className="px-3 py-1 bg-white/5 rounded-full">🛡️ {enemy.def}</span>
+                </div>
+
+                <div className="w-full max-w-sm mx-auto mb-8">
+                  <div className="flex justify-between items-end mb-1 px-1">
+                    <span className="text-[10px] font-black text-slate-500 uppercase">{enemy.isMega ? '!!! 大领主血量 !!!' : '敌方血量'}</span>
+                    <span className={`text-xs font-black tabular-nums ${enemy.isMega ? 'text-red-500' : 'text-white'}`}>{enemy.hp} / {enemy.maxHp}</span>
+                  </div>
+                  <div className={`h-4 bg-black rounded-full p-1 border overflow-hidden ${enemy.isMega ? 'border-red-600 h-6' : 'border-white/10'}`}>
+                    <div className={`h-full rounded-full transition-all duration-300 ${enemy.isMega ? 'bg-gradient-to-r from-red-900 via-red-500 to-red-900 shadow-[0_0_15px_red]' : 'bg-red-600'}`} style={{ width: `${(enemy.hp/enemy.maxHp)*100}%` }}></div>
+                  </div>
+                </div>
+
+                <div className="flex gap-4 w-full max-w-sm mx-auto">
+                  <button onClick={attack} className={`flex-1 py-4 rounded-2xl font-black text-sm transition-all ${enemy.isMega ? 'bg-red-600 text-white shadow-red-900/40 shadow-xl' : 'bg-white text-black hover:bg-slate-200'}`}>攻击</button>
+                  <button onClick={() => setEnemy(null)} className="px-8 bg-white/5 border border-white/10 text-slate-500 rounded-2xl text-[10px] font-black">撤退</button>
+                </div>
+              </div>
+            ) : (
+              <div className="text-center animate-in fade-in">
+                <button onClick={spawnEnemy} className="w-44 h-44 rounded-full border-2 border-dashed border-white/20 flex flex-col items-center justify-center hover:bg-white/5 group">
+                   <span className="text-6xl mb-2 group-hover:rotate-12 transition-transform">⚔️</span>
+                   <span className="text-[10px] font-black text-slate-500 tracking-[0.3em]">寻找敌人</span>
+                </button>
+                <div className="mt-8">
+                   <p className="text-[9px] text-slate-600 mb-2 uppercase font-black italic">精英进度 / 领主召唤</p>
+                   <div className="flex flex-col items-center gap-2">
+                     <div className="flex gap-1.5"> {/* 精英进度 */}
+                        {[...Array(5)].map((_, i) => (
+                          <div key={i} className={`w-3 h-1.5 rounded-full ${i < player.bossProgress ? 'bg-orange-500' : 'bg-white/10'}`}></div>
+                        ))}
+                     </div>
+                     <div className="flex gap-2 items-center"> {/* 领主进度 */}
+                        {[...Array(3)].map((_, i) => (
+                          <div key={i} className={`w-6 h-1 bg-white/5 rounded-full overflow-hidden`}>
+                            <div className={`h-full bg-red-600 transition-all ${i < player.eliteDefeatedCount ? 'w-full' : 'w-0'}`}></div>
+                          </div>
+                        ))}
+                        <span className="text-[8px] font-black text-red-900">BOSS</span>
+                     </div>
+                   </div>
+                </div>
+              </div>
+            )}
+          </div>
+
+          {/* 属性黑市 */}
+          <div className="grid grid-cols-2 gap-4">
+            <div className="bg-white/5 border border-white/10 rounded-2xl p-4">
+              <h3 className="text-[10px] font-black text-slate-500 mb-4 uppercase italic">永久训练</h3>
+              <div className="space-y-2">
+                {['atk', 'def', 'hp'].map(stat => (
+                  <button key={stat} onClick={() => {
+                    const cost = 200 + (player.statUpgrades[stat] * 150);
+                    if(player.gold >= cost) setPlayer(p => ({ ...p, gold: p.gold - cost, statUpgrades: { ...p.statUpgrades, [stat]: p.statUpgrades[stat] + 1 } }));
+                  }} className="w-full bg-black/60 border border-white/5 p-2 rounded-xl flex justify-between items-center text-[10px]">
+                    <span className="font-black text-slate-400 uppercase">{stat === 'atk' ? '力量' : stat === 'def' ? '体质' : '生命'}</span>
+                    <span className="text-yellow-600 font-bold">{200 + (player.statUpgrades[stat] * 150)}G</span>
+                  </button>
+                ))}
+              </div>
+            </div>
+            <div className="bg-white/5 border border-white/10 rounded-2xl p-4">
+              <h3 className="text-[10px] font-black text-slate-500 mb-4 uppercase italic">今日黑市</h3>
+              <div className="grid grid-cols-2 gap-2">
+                {shopItems.slice(0, 2).map((item, i) => (
+                  <div key={i} className="bg-black/60 p-2 rounded-lg border border-white/5 text-center">
+                    <div className={`text-[8px] font-black truncate ${getRarityColor(item.rarity)}`}>{item.name}</div>
+                    <button onClick={() => { if(player.gold >= item.price) { setPlayer(p => ({ ...p, gold: p.gold - item.price })); if(!handleAutoEquip(item)) setInventory(inv => [...inv, item]); setShopItems(s => s.filter((_, idx) => idx !== i)); } }} className="mt-1 text-[9px] text-yellow-500 font-black">{item.price}G</button>
+                  </div>
+                ))}
+              </div>
+            </div>
+          </div>
+        </div>
+
+        {/* 右侧：背包与日志 */}
+        <div className="lg:col-span-3 flex flex-col gap-4">
+          <div className="bg-white/5 border border-white/10 rounded-2xl p-4 flex-1 flex flex-col h-[500px]">
+            <h3 className="text-[10px] font-black text-slate-500 mb-4 flex justify-between italic uppercase">仓库 <span>{inventory.length}/20</span></h3>
+            <div className="flex-1 overflow-y-auto space-y-2 custom-scrollbar">
+               {inventory.map(item => (
+                 <div key={item.id} className="bg-black border border-white/5 p-2 rounded-xl">
+                    <div className={`text-[10px] font-black ${getRarityColor(item.rarity)}`}>{item.name}</div>
+                    <div className="flex justify-between items-center mt-2">
+                      <span className="text-[9px] text-slate-600">+{item.value} 属性</span>
+                      <button onClick={() => {
+                        const old = player.equipment[item.type];
+                        setPlayer(p => ({ ...p, equipment: { ...p.equipment, [item.type]: item } }));
+                        setInventory(inv => [...inv.filter(i => i.id !== item.id), ...(old ? [old] : [])]);
+                      }} className="bg-white text-black px-2 py-0.5 rounded text-[8px] font-black">装备</button>
+                    </div>
+                 </div>
+               ))}
+            </div>
+          </div>
+
+          <div className="h-40 bg-black/80 border border-white/5 rounded-2xl p-3 overflow-y-auto text-[9px] font-bold custom-scrollbar">
+            {logs.map((log, i) => (
+              <div key={i} className="mb-1 text-slate-500 border-b border-white/[0.03] pb-1">{log}</div>
+            ))}
+            <div ref={logEndRef}></div>
+          </div>
+        </div>
+      </div>
+      <style>{`
+        .custom-scrollbar::-webkit-scrollbar { width: 3px; }
+        .custom-scrollbar::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.05); }
+        @keyframes shake { 0%, 100% { transform: translateX(0); } 25% { transform: translateX(-2px); } 75% { transform: translateX(2px); } }
+        .animate-shake { animation: shake 0.2s infinite; }
+      `}</style>
+    </div>
+  );
+}
